@@ -65,6 +65,8 @@ struct Daemon {
     direct_rooms: std::sync::RwLock<HashSet<String>>,
     /// The room lifecycle notices go to.
     home_room: String,
+    /// `gray cmd` dispatch: `!name`/`/name`/`<bot>: name` prefixes.
+    commands: crate::commands::Commands,
 }
 
 impl Daemon {
@@ -208,6 +210,27 @@ impl Daemon {
                 log_failure("reset reply", room_id, &e);
             }
             return;
+        }
+
+        // Headless `gray cmd` surface: `!cmd`, `/cmd`, `bot: cmd`. A hit
+        // answers inline and never reaches the queue; an unknown name is
+        // an ordinary prompt.
+        if let Some((name, args)) = crate::commands::parse_prefixed(&text, &self.own_id) {
+            if let Some(reply) = self
+                .commands
+                .dispatch(&self.config, &self.config_path, &conversation, &name, &args)
+                .await
+            {
+                for chunk in crate::text::split_message(&reply, crate::matrix::MAX_MESSAGE_CHARS)
+                {
+                    let html = crate::text::md_to_html(&chunk);
+                    if let Err(e) = self.rest.send_text(room_id, &chunk, &html).await {
+                        log_failure("command reply", room_id, &e);
+                        break;
+                    }
+                }
+                return;
+            }
         }
 
         let capacity = self
@@ -556,6 +579,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         free_rooms,
         direct_rooms: std::sync::RwLock::new(direct_set),
         home_room,
+        commands: crate::commands::Commands::new(),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted
