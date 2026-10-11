@@ -68,6 +68,73 @@ impl Drop for ConversationLock {
     }
 }
 
+type Pipe = std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
+
+fn live() -> &'static std::sync::Mutex<std::collections::HashMap<String, Pipe>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Pipe>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+struct Live {
+    conversation: String,
+    pipe: Pipe,
+}
+
+impl Live {
+    fn register(conversation: &str, stdin: Option<tokio::process::ChildStdin>) -> Self {
+        let pipe: Pipe = std::sync::Arc::new(tokio::sync::Mutex::new(stdin));
+        if let Ok(mut map) = live().lock() {
+            map.insert(conversation.to_string(), pipe.clone());
+        }
+        Live {
+            conversation: conversation.to_string(),
+            pipe,
+        }
+    }
+
+    fn end(&self) {
+        if let Ok(mut map) = live().lock() {
+            if map
+                .get(&self.conversation)
+                .is_some_and(|p| std::sync::Arc::ptr_eq(p, &self.pipe))
+            {
+                map.remove(&self.conversation);
+            }
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+pub fn is_live(conversation: &str) -> bool {
+    live()
+        .lock()
+        .map(|m| m.contains_key(conversation))
+        .unwrap_or(false)
+}
+
+pub async fn steer(conversation: &str, text: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let pipe = live()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(conversation).cloned());
+    let Some(pipe) = pipe else {
+        return false;
+    };
+    let line = format!("{}\n", serde_json::json!({"type": "steer", "text": text}));
+    let mut guard = pipe.lock().await;
+    let Some(stdin) = guard.as_mut() else {
+        return false;
+    };
+    stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+}
+
 /// Single-quote shell escaping for launcher argv words.
 fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -276,7 +343,7 @@ pub async fn run_gray(
     let mut cmd = tokio::process::Command::new(&args[0]);
     cmd.args(&args[1..]);
     cmd.current_dir(&work);
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
@@ -306,6 +373,7 @@ pub async fn run_gray(
         ),
     );
     cmd.env("GRAY_SKILLS_ONLY", "1");
+    cmd.env("GRAY_STDIN_STEER", "1");
     // Tool narration is safe to show; raw model reasoning is not.
     cmd.env("GRAY_SHOW_REASONING", "0");
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
@@ -314,12 +382,13 @@ pub async fn run_gray(
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
+    let live = Live::register(conversation, child.stdin.take());
 
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| RunError::Spawn("no stdout".to_string()))?;
-    let consume = consume_ndjson(stdout, &state_path, &generation, &mut state);
+    let consume = consume_ndjson(stdout, &state_path, &generation, &mut state, &live);
     let outcome: Result<Consume, RunError> =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await {
             Ok(r) => r,
@@ -382,6 +451,7 @@ async fn consume_ndjson(
     state_path: &Path,
     generation: &str,
     state: &mut Value,
+    live: &Live,
 ) -> Result<Consume, RunError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stdout).lines();
@@ -447,9 +517,10 @@ async fn consume_ndjson(
         }
         match row.get("type").and_then(Value::as_str) {
             Some("result") | Some("error") => {
+                live.end();
                 terminal = Some(row);
             }
-            Some("progress") | Some("text") => {}
+            Some("progress") | Some("text") | Some("retract") => {}
             _ => {
                 protocol_ok = false;
             }

@@ -77,6 +77,10 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(map_err)?;
         conn.execute_batch(SCHEMA).map_err(map_err)?;
+        let _ = conn.execute(
+            "ALTER TABLE inbox ADD COLUMN retry_at REAL NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -133,15 +137,19 @@ impl Store {
             .map_err(map_err)
     }
 
-    /// Oldest queued item, atomically marked `running`.
+    /// Oldest queued item whose conversation has nothing running or older
+    /// still queued, atomically marked `running`.
     pub fn claim(&self) -> Result<Option<Item>, String> {
         let conn = self.conn.lock().map_err(|_| "store locked".to_string())?;
         let row = conn
             .query_row(
                 &format!(
-                    "SELECT {COLUMNS} FROM inbox WHERE state='queued' ORDER BY created LIMIT 1"
+                    "SELECT {COLUMNS} FROM inbox q WHERE state='queued' AND retry_at<=?1 \
+                     AND NOT EXISTS (SELECT 1 FROM inbox r WHERE r.conversation=q.conversation \
+                     AND (r.state='running' OR (r.state='queued' AND r.created<q.created))) \
+                     ORDER BY created LIMIT 1"
                 ),
-                [],
+                [now_secs()],
                 row_to_item,
             )
             .ok();
@@ -159,6 +167,31 @@ impl Store {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn requeue_busy(&self, id: &str, after_secs: f64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "store locked".to_string())?
+            .execute(
+                "UPDATE inbox SET state='queued', retry_at=?2 WHERE id=?1 AND state='running'",
+                rusqlite::params![id, now_secs() + after_secs],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    pub fn ahead(&self, conversation: &str, id: &str) -> Result<i64, String> {
+        self.conn
+            .lock()
+            .map_err(|_| "store locked".to_string())?
+            .query_row(
+                "SELECT COUNT(*) FROM inbox WHERE conversation=?1 AND id<>?2 \
+                 AND state IN ('queued','running')",
+                rusqlite::params![conversation, id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
     }
 
     /// Put a claimed item back (a Busy conversation holds its lock, or the

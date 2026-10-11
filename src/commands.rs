@@ -117,6 +117,12 @@ pub struct Commands {
     cache: tokio::sync::Mutex<Option<Cached>>,
 }
 
+impl Default for Commands {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Commands {
     pub fn new() -> Self {
         Self {
@@ -203,6 +209,9 @@ fn registry_from(out: &Value) -> Option<Registry> {
         let Some(name) = entry.get("name").and_then(Value::as_str) else {
             continue;
         };
+        if entry.get("source").and_then(Value::as_str) == Some("skill") {
+            continue;
+        }
         let scope = entry
             .get("scope")
             .and_then(Value::as_str)

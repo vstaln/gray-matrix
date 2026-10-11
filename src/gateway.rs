@@ -67,9 +67,18 @@ struct Daemon {
     home_room: String,
     /// `gray cmd` dispatch: `!name`/`/name`/`<bot>: name` prefixes.
     commands: crate::commands::Commands,
+    acks: crate::busy::Acks,
+    pager: crate::busy::Pager,
 }
 
 impl Daemon {
+    async fn say(&self, room_id: &str, text: &str, what: &str) {
+        let html = crate::text::md_to_html(text);
+        if let Err(e) = self.rest.send_text(room_id, text, &html).await {
+            log_failure(what, room_id, &e);
+        }
+    }
+
     /// `require_mention` config flag; default true (hermes semantics).
     fn require_mention(&self) -> bool {
         self.config
@@ -211,10 +220,37 @@ impl Daemon {
             return;
         }
 
+        let parsed = crate::commands::parse_prefixed(&text, &self.own_id);
+        if let Some((name, args)) = &parsed {
+            if name == "page" {
+                let reply = self
+                    .pager
+                    .page(&conversation, crate::busy::page_number(args));
+                self.say(room_id, &reply, "page reply").await;
+                return;
+            }
+        }
+        let steer = parsed
+            .as_ref()
+            .filter(|(name, _)| name == "steer")
+            .map(|(_, args)| args.clone());
+        if let Some(steer_text) = &steer {
+            if steer_text.is_empty() {
+                self.say(room_id, crate::busy::STEER_USAGE, "steer reply")
+                    .await;
+                return;
+            }
+            if crate::runner::steer(&conversation, steer_text).await {
+                self.say(room_id, crate::busy::STEERING, "steer reply")
+                    .await;
+                return;
+            }
+        }
+
         // Headless `gray cmd` surface: `!cmd`, `/cmd`, `bot: cmd`. A hit
         // answers inline and never reaches the queue; an unknown name is
         // an ordinary prompt.
-        if let Some((name, args)) = crate::commands::parse_prefixed(&text, &self.own_id) {
+        if let Some((name, args)) = parsed.filter(|_| steer.is_none()) {
             if let Some(outcome) = self
                 .commands
                 .dispatch(&self.config, &self.config_path, &conversation, &name, &args)
@@ -222,6 +258,12 @@ impl Daemon {
             {
                 match outcome {
                     crate::commands::Outcome::Text(reply) => {
+                        let reply = if name == "help" {
+                            format!("{reply}{}", crate::busy::help_suffix("/"))
+                        } else {
+                            reply
+                        };
+                        let reply = self.pager.first(&conversation, &reply);
                         if let Err(e) =
                             crate::matrix::send_long(&self.rest, room_id, &reply, 0).await
                         {
@@ -268,6 +310,16 @@ impl Daemon {
             }
         }
 
+        if steer.is_none()
+            && crate::busy::steer_mode(&self.config)
+            && crate::runner::steer(&conversation, &text).await
+        {
+            self.say(room_id, crate::busy::STEERING, "steer reply")
+                .await;
+            return;
+        }
+        let text = steer.clone().unwrap_or(text);
+
         let capacity = self
             .config
             .get("queue_capacity")
@@ -278,7 +330,19 @@ impl Daemon {
             .store
             .enqueue(&id, room_id, sender, &conversation, &text, capacity)
         {
-            Ok(true) => eprintln!("[matrix] queued {id} from {sender} in {room_id}"),
+            Ok(true) => {
+                eprintln!("[matrix] queued {id} from {sender} in {room_id}");
+                if steer.is_some() {
+                    self.say(room_id, crate::busy::IDLE_STEER, "steer reply")
+                        .await;
+                } else if let Some(ack) = self.acks.queued(
+                    &conversation,
+                    self.store.ahead(&conversation, &id).unwrap_or(0),
+                    crate::store::now_secs(),
+                ) {
+                    self.say(room_id, &ack, "queue ack").await;
+                }
+            }
             Ok(false) => {} // replayed event — already queued or done
             Err(e) => {
                 let html = crate::text::md_to_html("Queue full; try again later.");
@@ -343,8 +407,8 @@ impl Daemon {
                 }
             }
             Err(RunError::Busy) => {
-                self.store.requeue(&item.id)?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.store
+                    .requeue_busy(&item.id, crate::busy::BUSY_RETRY_SECS)?;
             }
             Err(e) => {
                 let note = e.to_string();
@@ -594,6 +658,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         direct_rooms: std::sync::RwLock::new(direct_set),
         home_room,
         commands: crate::commands::Commands::new(),
+        acks: crate::busy::Acks::default(),
+        pager: crate::busy::Pager::new(4000, 60, "/"),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted

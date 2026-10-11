@@ -117,7 +117,7 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
             }
         }
     }
-    if !data.get("homeserver").is_some_and(|v| homeserver_valid(v)) {
+    if !data.get("homeserver").is_some_and(homeserver_valid) {
         return Err("homeserver must be an http(s) base URL".to_string());
     }
     if !user_id_valid(&data["user_id"]) {
@@ -176,6 +176,12 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;
     int_in(data, "queue_capacity", 1, 100000)?;
+    if data
+        .get("busy_input_mode")
+        .is_some_and(|v| !matches!(v.as_str(), Some("queue" | "steer")))
+    {
+        return Err("busy_input_mode must be queue or steer".to_string());
+    }
     if let Some(policy) = data.get("session_reset") {
         if !policy.is_object() {
             return Err("session_reset must be an object".to_string());
