@@ -5,6 +5,8 @@ use std::sync::Mutex;
 pub const STEERING: &str = "Steering the current turn.";
 pub const IDLE_STEER: &str = "Nothing running — sent as a new message.";
 pub const STEER_USAGE: &str = "Usage: /steer <text>";
+pub const STOPPED: &str = "Stopped.";
+pub const NOTHING_RUNNING: &str = "Nothing running.";
 pub const BUSY_RETRY_SECS: f64 = 2.0;
 const ACK_EVERY_SECS: f64 = 30.0;
 
@@ -173,6 +175,24 @@ impl Pager {
 
 pub fn help_suffix(prefix: &str) -> String {
     format!(
-        "\n\nGateway: {prefix}steer <text> — steer the running turn · {prefix}page N — page N of the last long reply"
+        "\n\nGateway: {prefix}steer <text> — steer the running turn · {prefix}stop — cancel the running turn · {prefix}page N — page N of the last long reply"
     )
+}
+
+pub async fn cancellable<F: std::future::Future>(
+    fut: F,
+    cancelled: impl Fn() -> bool,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            _ = tick.tick() => {
+                if cancelled() {
+                    return None;
+                }
+            }
+        }
+    }
 }

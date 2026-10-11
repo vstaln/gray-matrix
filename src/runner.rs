@@ -68,6 +68,18 @@ impl Drop for ConversationLock {
     }
 }
 
+struct ProcessGroup(libc::pid_t);
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 type Pipe = std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
 
 fn live() -> &'static std::sync::Mutex<std::collections::HashMap<String, Pipe>> {
@@ -382,6 +394,7 @@ pub async fn run_gray(
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
+    let mut group = ProcessGroup(pid as libc::pid_t);
     let live = Live::register(conversation, child.stdin.take());
 
     let stdout = child
@@ -400,13 +413,13 @@ pub async fn run_gray(
                     }
                 }
                 let _ = child.wait().await;
+                group.0 = 0;
                 return Err(RunError::Timeout);
             }
         };
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| RunError::Spawn("wait failed".to_string()))?;
+    let status = child.wait().await;
+    group.0 = 0;
+    let status = status.map_err(|_| RunError::Spawn("wait failed".to_string()))?;
     let consumed = outcome?;
 
     // gray reports its request cap as a generic error row; the accounting

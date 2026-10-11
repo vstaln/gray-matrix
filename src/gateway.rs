@@ -229,6 +229,14 @@ impl Daemon {
                 self.say(room_id, &reply, "page reply").await;
                 return;
             }
+            if name == "stop" {
+                let reply = match self.store.cancel_conversation(&conversation) {
+                    Ok(true) => crate::busy::STOPPED,
+                    _ => crate::busy::NOTHING_RUNNING,
+                };
+                self.say(room_id, reply, "stop reply").await;
+                return;
+            }
         }
         let steer = parsed
             .as_ref()
@@ -367,15 +375,22 @@ impl Daemon {
             .rest
             .typing(&item.target, &self.own_id, true, 30_000)
             .await;
-        let outcome = crate::runner::run_gray(
-            &self.config,
-            &self.config_path,
-            &item.conversation,
-            &item.text,
-            None,
+        let outcome = crate::busy::cancellable(
+            crate::runner::run_gray(
+                &self.config,
+                &self.config_path,
+                &item.conversation,
+                &item.text,
+                None,
+            ),
+            || self.store.cancel_requested(&item.id).unwrap_or(false),
         )
         .await;
         let _ = self.rest.typing(&item.target, &self.own_id, false, 0).await;
+        let Some(outcome) = outcome else {
+            self.store.mark_cancelled(&item.id)?;
+            return Ok(true);
+        };
         match outcome {
             Ok(answer) => {
                 let chunks = crate::text::split_message(&answer, crate::matrix::MAX_MESSAGE_CHARS);
