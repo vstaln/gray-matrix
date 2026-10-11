@@ -86,11 +86,7 @@ impl Daemon {
                 .config
                 .get("allowed_users")
                 .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .any(|u| u == mxid)
-                })
+                .map(|a| a.iter().filter_map(Value::as_str).any(|u| u == mxid))
                 .unwrap_or(false)
     }
 
@@ -114,9 +110,10 @@ impl Daemon {
         if let Ok(mut w) = self.direct_rooms.write() {
             w.insert(room_id.to_string());
         }
-        let _ = self
-            .store
-            .meta_set(DIRECT_KEY, &Value::Array(all.into_iter().map(Value::String).collect()).to_string());
+        let _ = self.store.meta_set(
+            DIRECT_KEY,
+            &Value::Array(all.into_iter().map(Value::String).collect()).to_string(),
+        );
     }
 
     /// One inbound timeline event: admission, commands, enqueue.
@@ -149,7 +146,9 @@ impl Daemon {
             _ => return,
         }
         // Reply bodies quote the original above a blank line; drop that.
-        let text = crate::text::strip_reply_fallback(text.trim()).trim().to_string();
+        let text = crate::text::strip_reply_fallback(text.trim())
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -216,17 +215,57 @@ impl Daemon {
         // answers inline and never reaches the queue; an unknown name is
         // an ordinary prompt.
         if let Some((name, args)) = crate::commands::parse_prefixed(&text, &self.own_id) {
-            if let Some(reply) = self
+            if let Some(outcome) = self
                 .commands
                 .dispatch(&self.config, &self.config_path, &conversation, &name, &args)
                 .await
             {
-                for chunk in crate::text::split_message(&reply, crate::matrix::MAX_MESSAGE_CHARS)
-                {
-                    let html = crate::text::md_to_html(&chunk);
-                    if let Err(e) = self.rest.send_text(room_id, &chunk, &html).await {
-                        log_failure("command reply", room_id, &e);
-                        break;
+                match outcome {
+                    crate::commands::Outcome::Text(reply) => {
+                        for chunk in
+                            crate::text::split_message(&reply, crate::matrix::MAX_MESSAGE_CHARS)
+                        {
+                            let html = crate::text::md_to_html(&chunk);
+                            if let Err(e) = self.rest.send_text(room_id, &chunk, &html).await {
+                                log_failure("command reply", room_id, &e);
+                                break;
+                            }
+                        }
+                    }
+                    crate::commands::Outcome::Prompt { prompt, fallback } => {
+                        let capacity = self
+                            .config
+                            .get("queue_capacity")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1000);
+                        let id = format!("mx:{event_id}:cmd");
+                        match self.store.enqueue(
+                            &id,
+                            room_id,
+                            sender,
+                            &conversation,
+                            &prompt,
+                            capacity,
+                        ) {
+                            Ok(true) => {
+                                if !fallback.trim().is_empty() {
+                                    let html = crate::text::md_to_html(&fallback);
+                                    let _ = self.rest.send_text(room_id, &fallback, &html).await;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                let _ = self
+                                    .rest
+                                    .send_text(
+                                        room_id,
+                                        "Queue full; try again later.",
+                                        "Queue full; try again later.",
+                                    )
+                                    .await;
+                                eprintln!("[matrix] command turn enqueue failed: {e}");
+                            }
+                        }
                     }
                 }
                 return;
@@ -276,16 +315,10 @@ impl Daemon {
             None,
         )
         .await;
-        let _ = self
-            .rest
-            .typing(&item.target, &self.own_id, false, 0)
-            .await;
+        let _ = self.rest.typing(&item.target, &self.own_id, false, 0).await;
         match outcome {
             Ok(answer) => {
-                let chunks = crate::text::split_message(
-                    &answer,
-                    crate::matrix::MAX_MESSAGE_CHARS,
-                );
+                let chunks = crate::text::split_message(&answer, crate::matrix::MAX_MESSAGE_CHARS);
                 let mut attempts = 0u32;
                 let mut sent = 0usize;
                 'deliver: loop {
@@ -306,8 +339,7 @@ impl Daemon {
                                 if sent == 0 {
                                     self.store.fail(&item.id, "delivery failed")?;
                                 } else {
-                                    self.store
-                                        .fail(&item.id, "delivery partially failed")?;
+                                    self.store.fail(&item.id, "delivery partially failed")?;
                                 }
                                 break 'deliver;
                             }
@@ -408,9 +440,9 @@ fn apply_direct_account_data(daemon: &Daemon, sync: &Value) {
         .and_then(|a| a.get("events"))
         .and_then(Value::as_array)
         .and_then(|events| {
-            events.iter().find(|e| {
-                e.get("type").and_then(Value::as_str) == Some("m.direct")
-            })
+            events
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("m.direct"))
         })
         .and_then(|e| e.get("content"))
         .and_then(Value::as_object)
@@ -430,10 +462,7 @@ fn apply_direct_account_data(daemon: &Daemon, sync: &Value) {
 /// allowlist, or when the invite is `is_direct` (a DM is how pairing starts,
 /// and admission still gates what the inviter can do).
 async fn handle_invites(daemon: &Daemon, sync: &Value) {
-    let Some(invites) = sync
-        .pointer("/rooms/invite")
-        .and_then(Value::as_object)
-    else {
+    let Some(invites) = sync.pointer("/rooms/invite").and_then(Value::as_object) else {
         return;
     };
     for room_id in invites.keys() {
@@ -475,17 +504,11 @@ async fn handle_invites(daemon: &Daemon, sync: &Value) {
 async fn apply_sync(daemon: &Daemon, sync: &Value) {
     apply_direct_account_data(daemon, sync);
     handle_invites(daemon, sync).await;
-    let Some(joined) = sync
-        .pointer("/rooms/join")
-        .and_then(Value::as_object)
-    else {
+    let Some(joined) = sync.pointer("/rooms/join").and_then(Value::as_object) else {
         return;
     };
     for (room_id, room) in joined {
-        let Some(events) = room
-            .pointer("/timeline/events")
-            .and_then(Value::as_array)
-        else {
+        let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) else {
             continue;
         };
         for event in events {
@@ -646,7 +669,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let stop_reason: Result<(), String> = 'outer: loop {
         let poll = daemon.rest.sync(
             since.as_deref(),
-            if first { 0 } else { crate::matrix::LONG_POLL_MS },
+            if first {
+                0
+            } else {
+                crate::matrix::LONG_POLL_MS
+            },
         );
         let sync = tokio::select! {
             sync = poll => sync,
@@ -673,10 +700,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 if let Some(text) = notice.take() {
                     if !daemon.home_room.is_empty() {
                         let html = crate::text::md_to_html(&text);
-                        if let Err(e) = daemon
-                            .rest
-                            .send_text(&daemon.home_room, &text, &html)
-                            .await
+                        if let Err(e) = daemon.rest.send_text(&daemon.home_room, &text, &html).await
                         {
                             log_failure("boot notice", &daemon.home_room, &e);
                         }

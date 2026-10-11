@@ -20,11 +20,16 @@ use std::time::{Duration, Instant};
 const LIST_TTL: Duration = Duration::from_secs(300);
 /// Hard budget on one `cmd` call: list and run are headless and quick.
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Registry rows marked `slow` (compaction, plugin calls, updates) get
+/// this window instead — a room reply has no platform deadline.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The v1 text command set. When `cmd list` cannot be fetched — an older
 /// gray without the verb, a spawn failure — only these are dispatched, so
 /// a mistyped `!anything` still lands on the prompt path as before.
-const FALLBACK: &[&str] = &["help", "model", "usage", "new", "sessions", "cron", "skills"];
+const FALLBACK: &[&str] = &[
+    "help", "model", "usage", "new", "sessions", "cron", "skills",
+];
 
 /// `[a-z][a-z0-9_-]*` — the command-name shape the contract allows.
 fn name_valid(name: &str) -> bool {
@@ -73,7 +78,9 @@ pub fn parse_prefixed(text: &str, own_id: &str) -> Option<(String, String)> {
     let t = text.trim();
     let body: &str = if let Some(rest) = strip_mention(t, own_id) {
         // `bot: name` as well as `bot: !name`.
-        rest.strip_prefix(['!', '/']).map(str::trim_start).unwrap_or(rest)
+        rest.strip_prefix(['!', '/'])
+            .map(str::trim_start)
+            .unwrap_or(rest)
     } else {
         match t.as_bytes().first() {
             Some(b'!') | Some(b'/') => t[1..].trim_start(),
@@ -95,6 +102,8 @@ struct Registry {
     names: HashSet<String>,
     /// canonical name or alias -> "conversation" | "global" | ...
     scopes: HashMap<String, String>,
+    /// Names (and aliases) whose runs can outlast the normal timeout.
+    slow: HashSet<String>,
 }
 
 struct Cached {
@@ -137,8 +146,7 @@ impl Commands {
         out
     }
 
-    /// `Some(reply)` when `name` is a real command — the answer (or the
-    /// command's own error text) to post in the room. `None` leaves the
+    /// `Some(answer)` when `name` is a real command — `None` leaves the
     /// message on the normal prompt path.
     pub async fn dispatch(
         &self,
@@ -147,7 +155,7 @@ impl Commands {
         conversation: &str,
         name: &str,
         args: &str,
-    ) -> Option<String> {
+    ) -> Option<Outcome> {
         let home = crate::session::conversation_home(config_path, conversation);
         let _ = prepare_home(config, &home);
         let registry = self.registry(config, &home).await;
@@ -167,7 +175,7 @@ impl Commands {
         } else {
             home
         };
-        Some(run_command(config, &run_home, name, args).await)
+        Some(run_command(config, &run_home, name, args, registry.slow.contains(name)).await)
     }
 }
 
@@ -189,9 +197,7 @@ fn registry_from(out: &Value) -> Option<Registry> {
     if out.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let commands = out
-        .pointer("/result/commands")
-        .and_then(Value::as_array)?;
+    let commands = out.pointer("/result/commands").and_then(Value::as_array)?;
     let mut registry = Registry::default();
     for entry in commands {
         let Some(name) = entry.get("name").and_then(Value::as_str) else {
@@ -201,10 +207,12 @@ fn registry_from(out: &Value) -> Option<Registry> {
             .get("scope")
             .and_then(Value::as_str)
             .unwrap_or("conversation");
+        let slow = entry.get("slow").and_then(Value::as_bool).unwrap_or(false);
         registry.names.insert(name.to_string());
-        registry
-            .scopes
-            .insert(name.to_string(), scope.to_string());
+        registry.scopes.insert(name.to_string(), scope.to_string());
+        if slow {
+            registry.slow.insert(name.to_string());
+        }
         for alias in entry
             .get("aliases")
             .and_then(Value::as_array)
@@ -217,6 +225,9 @@ fn registry_from(out: &Value) -> Option<Registry> {
                 .scopes
                 .entry(alias.to_string())
                 .or_insert_with(|| scope.to_string());
+            if slow {
+                registry.slow.insert(alias.to_string());
+            }
         }
     }
     if registry.names.is_empty() {
@@ -241,23 +252,50 @@ fn run_argv(name: &str, args: &str) -> Vec<String> {
     argv
 }
 
-/// `cmd run <name> [args]` -> the text to post. A gray too old for `cmd`
-/// writes clap usage to stderr instead of an envelope; say so plainly.
-async fn run_command(config: &Value, home: &Path, name: &str, args: &str) -> String {
-    match cmd_json(config, home, &run_argv(name, args)).await {
+/// What a `cmd run` answer becomes: room text, or a prompt the caller
+/// queues as a turn in this conversation.
+#[derive(Debug)]
+pub enum Outcome {
+    Text(String),
+    Prompt { prompt: String, fallback: String },
+}
+
+/// `cmd run <name> [args]` -> the answer. A gray too old for `cmd` writes
+/// clap usage to stderr instead of an envelope; say so plainly.
+async fn run_command(config: &Value, home: &Path, name: &str, args: &str, slow: bool) -> Outcome {
+    let timeout = if slow { SLOW_TIMEOUT } else { CMD_TIMEOUT };
+    match cmd_json_t(config, home, &run_argv(name, args), timeout).await {
         Ok(out) => render_result(&out),
-        Err(e) if e == "gray cmd returned no result" => {
-            "This gray does not have `cmd` yet; send the request as a normal message.".to_string()
-        }
-        Err(e) => e,
+        Err(e) if e == "gray cmd returned no result" => Outcome::Text(
+            "This gray does not have `cmd` yet; send the request as a normal message.".to_string(),
+        ),
+        Err(e) => Outcome::Text(e),
     }
 }
 
-/// One `cmd` envelope reduced to postable room text. `kind:"ui"` degrades
-/// to `fallback_text`; errors post their `error.message`.
-pub fn render_result(out: &Value) -> String {
+/// One `cmd` envelope reduced to its room action. `kind:"ui"` degrades to
+/// `fallback_text`; `kind:"prompt"` hands back a turn; errors post their
+/// `error.message`.
+pub fn render_result(out: &Value) -> Outcome {
     if out.get("ok").and_then(Value::as_bool) == Some(true) {
         let result = out.get("result").cloned().unwrap_or(Value::Null);
+        if result.get("kind").and_then(Value::as_str) == Some("prompt") {
+            let prompt = result
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if prompt.is_empty() {
+                return Outcome::Text("gray answered an empty prompt.".to_string());
+            }
+            let fallback = result
+                .get("fallback_text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Outcome::Prompt { prompt, fallback };
+        }
         let field = match result.get("kind").and_then(Value::as_str) {
             Some("ui") => "fallback_text",
             _ => "text",
@@ -267,22 +305,22 @@ pub fn render_result(out: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        if text.is_empty() {
+        Outcome::Text(if text.is_empty() {
             "Done.".to_string()
         } else {
             text.to_string()
-        }
+        })
     } else {
         let message = out
             .pointer("/error/message")
             .and_then(Value::as_str)
             .unwrap_or("command failed")
             .trim();
-        if message.is_empty() {
+        Outcome::Text(if message.is_empty() {
             "command failed".to_string()
         } else {
             message.to_string()
-        }
+        })
     }
 }
 
@@ -297,7 +335,10 @@ fn prepare_home(config: &Value, home: &Path) -> Result<(), String> {
         .create(home)
         .map_err(|_| "cannot create conversation home".to_string())?;
     let _ = std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700));
-    let gray_home = config.get("gray_home").and_then(Value::as_str).unwrap_or("");
+    let gray_home = config
+        .get("gray_home")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if gray_home.is_empty() {
         return Ok(());
     }
@@ -316,6 +357,15 @@ fn prepare_home(config: &Value, home: &Path) -> Result<(), String> {
 /// `GRAY_HOME=<home> gray cmd <argv>` — one JSON object on stdout, with a
 /// turn child's env discipline: GRAY_*/MATRIX_* scrubbed, PATH re-derived.
 async fn cmd_json(config: &Value, home: &Path, argv: &[String]) -> Result<Value, String> {
+    cmd_json_t(config, home, argv, CMD_TIMEOUT).await
+}
+
+async fn cmd_json_t(
+    config: &Value,
+    home: &Path,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<Value, String> {
     let gray_bin = config.get("gray_bin").and_then(Value::as_str).unwrap_or("");
     if gray_bin.is_empty() {
         return Err("gray executable is missing".to_string());
@@ -333,7 +383,9 @@ async fn cmd_json(config: &Value, home: &Path, argv: &[String]) -> Result<Value,
         let Some(k_str) = k.to_str() else {
             continue;
         };
-        if k_str.starts_with("GRAY_") || k_str.starts_with("MATRIX_") || k_str.starts_with("OPENAI_")
+        if k_str.starts_with("GRAY_")
+            || k_str.starts_with("MATRIX_")
+            || k_str.starts_with("OPENAI_")
         {
             continue;
         }
@@ -349,7 +401,7 @@ async fn cmd_json(config: &Value, home: &Path, argv: &[String]) -> Result<Value,
         ),
     );
     let child = cmd.spawn().map_err(|_| "cannot start gray".to_string())?;
-    let out = match tokio::time::timeout(CMD_TIMEOUT, child.wait_with_output()).await {
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(_)) => return Err("gray cmd failed".to_string()),
         Err(_) => return Err("gray cmd timed out".to_string()),
@@ -372,12 +424,12 @@ mod tests {
     fn parses_bang_and_slash() {
         assert_eq!(
             parsed("!model anthropic/claude-sonnet-4.6"),
-            Some(("model".to_string(), "anthropic/claude-sonnet-4.6".to_string()))
+            Some((
+                "model".to_string(),
+                "anthropic/claude-sonnet-4.6".to_string()
+            ))
         );
-        assert_eq!(
-            parsed("/usage"),
-            Some(("usage".to_string(), String::new()))
-        );
+        assert_eq!(parsed("/usage"), Some(("usage".to_string(), String::new())));
         assert_eq!(
             parsed("!help extra words"),
             Some(("help".to_string(), "extra words".to_string()))
@@ -451,7 +503,10 @@ mod tests {
             registry.scopes.get("gateway").map(String::as_str),
             Some("global")
         );
-        assert_eq!(registry.scopes.get("m").map(String::as_str), Some("conversation"));
+        assert_eq!(
+            registry.scopes.get("m").map(String::as_str),
+            Some("conversation")
+        );
 
         let bad = serde_json::json!({"ok": false, "error": {"code": "x", "message": "m"}});
         assert!(registry_from(&bad).is_none());
@@ -474,22 +529,37 @@ mod tests {
             "ok": true,
             "result": {"kind": "text", "text": "**hi**", "close": true}
         });
-        assert_eq!(render_result(&text), "**hi**");
+        match render_result(&text) {
+            Outcome::Text(t) => assert_eq!(t, "**hi**"),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let ui = serde_json::json!({
             "ok": true,
             "result": {"kind": "ui", "token": "t", "document": {},
                        "fallback_text": "1. one\n2. two"}
         });
-        assert_eq!(render_result(&ui), "1. one\n2. two");
+        match render_result(&ui) {
+            Outcome::Text(t) => assert_eq!(t, "1. one\n2. two"),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let err = serde_json::json!({
             "ok": false,
             "error": {"code": "unknown_command", "message": "no such command"}
         });
-        assert_eq!(render_result(&err), "no such command");
+        match render_result(&err) {
+            Outcome::Text(t) => assert_eq!(t, "no such command"),
+            other => panic!("expected text: {other:?}"),
+        }
 
-        assert_eq!(render_result(&serde_json::json!({"ok": true})), "Done.");
-        assert_eq!(render_result(&serde_json::json!({"ok": false})), "command failed");
+        match render_result(&serde_json::json!({"ok": true})) {
+            Outcome::Text(t) => assert_eq!(t, "Done."),
+            other => panic!("expected text: {other:?}"),
+        }
+        match render_result(&serde_json::json!({"ok": false})) {
+            Outcome::Text(t) => assert_eq!(t, "command failed"),
+            other => panic!("expected text: {other:?}"),
+        }
     }
 }
