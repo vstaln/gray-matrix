@@ -34,9 +34,7 @@ pub enum TransportError {
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Auth(_) => {
-                f.write_str("Matrix authentication failed; check the access token")
-            }
+            Self::Auth(_) => f.write_str("Matrix authentication failed; check the access token"),
             Self::Forbidden(_) => {
                 f.write_str("Matrix refused the request; the account may lack power in the room")
             }
@@ -274,6 +272,49 @@ impl Rest {
         .await
     }
 
+    /// `POST /_matrix/media/v3/upload` then one `m.file` event — the
+    /// attachment half of long-reply delivery.
+    pub async fn send_file(
+        &self,
+        room_id: &str,
+        path: &std::path::Path,
+        filename: &str,
+    ) -> Result<Value, TransportError> {
+        let bytes =
+            std::fs::read(path).map_err(|_| TransportError::Invalid("cannot read file".into()))?;
+        let size = bytes.len();
+        let media = self.base.replace("/_matrix/client/v3", "/_matrix/media/v3");
+        let resp = self
+            .client
+            .post(format!("{media}/upload"))
+            .query(&[("filename", filename)])
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| TransportError::Net("upload failed".into()))?;
+        let body = self.classify(resp).await?;
+        let url = body
+            .get("content_uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| TransportError::Net("upload returned no uri".into()))?;
+        self.put(
+            &format!(
+                "/rooms/{}/send/m.room.message/{}",
+                enc(room_id),
+                enc(&self.next_txn())
+            ),
+            &json!({
+                "msgtype": "m.file",
+                "body": filename,
+                "filename": filename,
+                "url": url,
+                "info": {"mimetype": "text/plain", "size": size},
+            }),
+        )
+        .await
+    }
+
     /// `PUT /rooms/{room}/typing/{user}` — the typing bubble. Best-effort.
     pub async fn typing(
         &self,
@@ -389,6 +430,49 @@ pub async fn login(
     Ok((token.to_string(), user_id))
 }
 
+/// Deliver `text` to `room_id`: consecutive messages up to eight, and past
+/// that the first message plus the whole body as a file attachment. `sent`
+/// counts sends already completed so a retry resumes instead of repeating.
+pub async fn send_long(
+    rest: &Rest,
+    room_id: &str,
+    text: &str,
+    mut sent: usize,
+) -> Result<usize, TransportError> {
+    let chunks = crate::text::split_message(text, MAX_MESSAGE_CHARS);
+    if chunks.is_empty() {
+        return Ok(sent);
+    }
+    if chunks.len() > 8 {
+        if sent == 0 {
+            let html = crate::text::md_to_html(&chunks[0]);
+            rest.send_text(room_id, &chunks[0], &html).await?;
+            sent = 1;
+        }
+        if sent == 1 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir()
+                .join(format!("gray-matrix-{}-{nonce}.txt", std::process::id()));
+            std::fs::write(&path, text)
+                .map_err(|_| TransportError::Invalid("cannot stage file".into()))?;
+            let result = rest.send_file(room_id, &path, "full-reply.txt").await;
+            let _ = std::fs::remove_file(&path);
+            result?;
+            sent = 2;
+        }
+        return Ok(sent);
+    }
+    for chunk in chunks.iter().skip(sent) {
+        let html = crate::text::md_to_html(chunk);
+        rest.send_text(room_id, chunk, &html).await?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
 /// Read a config string.
 pub fn cfg_str<'a>(cfg: &'a Value, key: &str) -> &'a str {
     cfg.get(key).and_then(Value::as_str).unwrap_or("")
@@ -401,20 +485,13 @@ pub async fn standalone_send(cfg: &Value, room: &str, text: &str) -> Result<Stri
     let Some(rest) = Rest::from_config(cfg) else {
         return Err("matrix access token is not configured".to_string());
     };
-    let room_id = rest
-        .resolve_room(room)
-        .await
-        .map_err(|e| e.to_string())?;
-    let chunks = crate::text::split_message(text, MAX_MESSAGE_CHARS);
-    if chunks.is_empty() {
+    let room_id = rest.resolve_room(room).await.map_err(|e| e.to_string())?;
+    if text.trim().is_empty() {
         return Err("text is empty".to_string());
     }
-    for chunk in &chunks {
-        let html = crate::text::md_to_html(chunk);
-        rest.send_text(&room_id, chunk, &html)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    send_long(&rest, &room_id, text, 0)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(format!("Sent to {room}."))
 }
 

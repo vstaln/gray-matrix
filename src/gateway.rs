@@ -222,14 +222,10 @@ impl Daemon {
             {
                 match outcome {
                     crate::commands::Outcome::Text(reply) => {
-                        for chunk in
-                            crate::text::split_message(&reply, crate::matrix::MAX_MESSAGE_CHARS)
+                        if let Err(e) =
+                            crate::matrix::send_long(&self.rest, room_id, &reply, 0).await
                         {
-                            let html = crate::text::md_to_html(&chunk);
-                            if let Err(e) = self.rest.send_text(room_id, &chunk, &html).await {
-                                log_failure("command reply", room_id, &e);
-                                break;
-                            }
+                            log_failure("command reply", room_id, &e);
                         }
                     }
                     crate::commands::Outcome::Prompt { prompt, fallback } => {
@@ -319,33 +315,28 @@ impl Daemon {
         match outcome {
             Ok(answer) => {
                 let chunks = crate::text::split_message(&answer, crate::matrix::MAX_MESSAGE_CHARS);
+                let total = if chunks.len() > 8 { 2 } else { chunks.len() };
                 let mut attempts = 0u32;
                 let mut sent = 0usize;
                 'deliver: loop {
-                    for chunk in chunks.iter().skip(sent) {
-                        match self
-                            .rest
-                            .send_text(&item.target, chunk, &crate::text::md_to_html(chunk))
-                            .await
-                        {
-                            Ok(_) => sent += 1,
-                            Err(e) if e.is_retryable() && attempts < 5 => {
-                                attempts += 1;
-                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                continue 'deliver;
+                    match crate::matrix::send_long(&self.rest, &item.target, &answer, sent).await {
+                        Ok(n) => sent = n,
+                        Err(e) if e.is_retryable() && attempts < 5 => {
+                            attempts += 1;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue 'deliver;
+                        }
+                        Err(e) => {
+                            log_failure("delivery", &item.target, &e);
+                            if sent == 0 {
+                                self.store.fail(&item.id, "delivery failed")?;
+                            } else {
+                                self.store.fail(&item.id, "delivery partially failed")?;
                             }
-                            Err(e) => {
-                                log_failure("delivery", &item.target, &e);
-                                if sent == 0 {
-                                    self.store.fail(&item.id, "delivery failed")?;
-                                } else {
-                                    self.store.fail(&item.id, "delivery partially failed")?;
-                                }
-                                break 'deliver;
-                            }
+                            break 'deliver;
                         }
                     }
-                    if sent == chunks.len() {
+                    if sent >= total {
                         self.store.complete(&item.id, &answer)?;
                     }
                     break 'deliver;
