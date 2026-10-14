@@ -356,7 +356,14 @@ fn prepare_home(config: &Value, home: &Path) -> Result<(), String> {
         return Ok(());
     }
     if let Ok(bytes) = std::fs::read(&provider_path) {
-        if let Ok(provider) = serde_json::from_slice::<Value>(&bytes) {
+        if let Ok(mut provider) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(model) = config
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+            {
+                provider["model"] = Value::String(model.to_string());
+            }
             crate::config::atomic_json(&home.join("config.json"), &provider)?;
         }
     }

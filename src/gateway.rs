@@ -426,7 +426,7 @@ impl Daemon {
                     .requeue_busy(&item.id, crate::busy::BUSY_RETRY_SECS)?;
             }
             Err(e) => {
-                let note = e.to_string();
+                let note = crate::runner::failure_notice(&e);
                 let html = crate::text::md_to_html(&note);
                 if let Err(e) = self.rest.send_text(&item.target, &note, &html).await {
                     log_failure("error reply", &item.target, &e);

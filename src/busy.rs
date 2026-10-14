@@ -5,7 +5,7 @@ use std::sync::Mutex;
 pub const STEERING: &str = "Steering the current turn.";
 pub const IDLE_STEER: &str = "Nothing running — sent as a new message.";
 pub const STEER_USAGE: &str = "Usage: /steer <text>";
-pub const STOPPED: &str = "Stopped.";
+pub const STOPPED: &str = "Stopped. Some steps may already have run.";
 pub const NOTHING_RUNNING: &str = "Nothing running.";
 pub const BUSY_RETRY_SECS: f64 = 2.0;
 const ACK_EVERY_SECS: f64 = 30.0;

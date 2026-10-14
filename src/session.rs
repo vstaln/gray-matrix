@@ -117,7 +117,11 @@ pub fn conversation_key(room: &str, sender: &str, is_dm: bool) -> String {
 pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     let sessions = home.join("sessions");
     if sessions.is_dir() {
-        clear_jsonl(&sessions)?;
+        let stamp = local_at(now)
+            .map(|t| t.format("%Y%m%d-%H%M%S").to_string())
+            .ok_or_else(|| "cannot name session archive".to_string())?;
+        let archive = new_archive_dir(&home.join("sessions-archive"), &stamp)?;
+        archive_jsonl(&sessions, &archive)?;
     }
     let state = json!({
         "generation": crate::store::uuid_hex(),
@@ -126,7 +130,26 @@ pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     crate::config::atomic_json(&home.join("session.json"), &state)
 }
 
-fn clear_jsonl(dir: &Path) -> Result<(), String> {
+fn new_archive_dir(root: &Path, stamp: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|_| "cannot create session archive".to_string())?;
+    let mut n = 1;
+    loop {
+        let name = if n == 1 {
+            stamp.to_string()
+        } else {
+            format!("{stamp}-{n}")
+        };
+        let dir = root.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(_) => return Err("cannot create session archive".to_string()),
+        }
+    }
+}
+
+fn archive_jsonl(dir: &Path, dest: &Path) -> Result<(), String> {
+    let archive_err = || "cannot archive conversation session".to_string();
     let entries =
         std::fs::read_dir(dir).map_err(|_| "cannot list conversation sessions".to_string())?;
     for entry in entries {
@@ -135,11 +158,15 @@ fn clear_jsonl(dir: &Path) -> Result<(), String> {
         let file_type = entry
             .file_type()
             .map_err(|_| "cannot inspect conversation session".to_string())?;
+        let target = dest.join(entry.file_name());
         if file_type.is_dir() {
-            clear_jsonl(&path)?;
+            archive_jsonl(&path, &target)?;
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            std::fs::remove_file(path)
-                .map_err(|_| "cannot clear conversation session".to_string())?;
+            std::fs::create_dir_all(dest).map_err(|_| archive_err())?;
+            if std::fs::rename(&path, &target).is_err() {
+                std::fs::copy(&path, &target).map_err(|_| archive_err())?;
+                std::fs::remove_file(&path).map_err(|_| archive_err())?;
+            }
         }
     }
     Ok(())
