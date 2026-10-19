@@ -100,12 +100,42 @@ struct Consume {
 }
 
 /// Held while a turn runs on a conversation home.
-struct ProcessGroup(u32);
+struct ProcessGroup {
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<JobGuard>,
+}
+
+impl ProcessGroup {
+    #[cfg(unix)]
+    fn new(pid: u32) -> Self {
+        Self { pid }
+    }
+
+    #[cfg(windows)]
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            job: assign_job(pid),
+        }
+    }
+
+    #[cfg(unix)]
+    fn disarm(&mut self) {
+        self.pid = 0;
+    }
+
+    #[cfg(windows)]
+    fn disarm(&mut self) {
+        self.pid = 0;
+        self.job = None;
+    }
+}
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if self.0 > 0 {
-            kill_process_tree(self.0);
+        if self.pid > 0 {
+            kill_process_tree(self.pid);
         }
     }
 }
@@ -125,6 +155,53 @@ fn kill_process_tree(pid: u32) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+
+#[cfg(windows)]
+struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobGuard {}
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            TerminateJobObject(self.0, 1);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+// taskkill /T needs the parent alive to walk the tree; a Job Object
+// terminates the tree even after the leader has exited.
+#[cfg(windows)]
+fn assign_job(pid: u32) -> Option<JobGuard> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+    unsafe {
+        let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+        if proc.is_null() {
+            return None;
+        }
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        let ok = !job.is_null() && AssignProcessToJobObject(job, proc) != 0;
+        CloseHandle(proc);
+        if ok {
+            Some(JobGuard(job))
+        } else {
+            if !job.is_null() {
+                CloseHandle(job);
+            }
+            None
+        }
+    }
 }
 
 type Pipe = std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
@@ -495,7 +572,7 @@ exec {} sidecar --config {}
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
-    let mut group = ProcessGroup(pid);
+    let mut group = ProcessGroup::new(pid);
     let live = Live::register(conversation, child.stdin.take());
 
     let stdout = child
@@ -511,13 +588,14 @@ exec {} sidecar --config {}
                 if pid != 0 {
                     kill_process_tree(pid);
                 }
-                let _ = child.wait().await;
-                group.0 = 0;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                group.disarm();
                 return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child.wait().await;
-    group.0 = 0;
+    group.disarm();
     let status = status.map_err(|_| RunError::Spawn("wait failed".to_string()))?;
     let consumed = outcome?;
 
