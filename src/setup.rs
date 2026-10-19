@@ -52,6 +52,7 @@ impl Prompter for Tty {
 /// Echo off for one read. Ctrl-C would otherwise kill setup with the
 /// terminal still silent, so SIGINT restores it first (tcsetattr is
 /// async-signal-safe).
+#[cfg(unix)]
 fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     static SAVED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
     extern "C" fn restore_and_exit(_: libc::c_int) {
@@ -80,24 +81,95 @@ fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Windows echo off for one read: clear ENABLE_ECHO_INPUT on the console
+/// input buffer. A console control handler puts the mode back before the
+/// default Ctrl-C processing kills setup, same shape as the unix version.
+#[cfg(windows)]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    use std::ffi::c_void;
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+    const STD_INPUT_HANDLE: Dword = -10i32 as Dword;
+    const ENABLE_ECHO_INPUT: Dword = 0x0004;
+    extern "system" {
+        fn GetStdHandle(which: Dword) -> Handle;
+        fn GetConsoleMode(handle: Handle, mode: *mut Dword) -> Bool;
+        fn SetConsoleMode(handle: Handle, mode: Dword) -> Bool;
+        fn SetConsoleCtrlHandler(
+            handler: Option<extern "system" fn(Dword) -> Bool>,
+            add: Bool,
+        ) -> Bool;
+    }
+    static SAVED: std::sync::OnceLock<Dword> = std::sync::OnceLock::new();
+    extern "system" fn restore(_: Dword) -> Bool {
+        if let Some(&mode) = SAVED.get() {
+            unsafe {
+                SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode);
+            }
+        }
+        0
+    }
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if input.is_null() {
+        return read();
+    }
+    let mut mode: Dword = 0;
+    if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+        return read();
+    }
+    let saved = *SAVED.get_or_init(|| mode);
+    unsafe {
+        SetConsoleMode(input, saved & !ENABLE_ECHO_INPUT);
+        SetConsoleCtrlHandler(Some(restore), 1);
+    }
+    let out = read();
+    unsafe {
+        SetConsoleMode(input, saved);
+        SetConsoleCtrlHandler(Some(restore), 0);
+    }
+    out
+}
+
+#[cfg(not(any(unix, windows)))]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    read()
+}
+
 /// Resolve the gray binary (`GRAY_BIN` env or `PATH` lookup).
 fn resolve_gray(explicit: &str) -> Option<String> {
     let candidate = explicit.trim();
     if candidate.is_empty() {
         return None;
     }
-    if candidate.contains('/') {
+    if candidate.contains('/') || candidate.contains('\\') {
         let path = Path::new(candidate);
         if path.is_file() && is_executable(path) {
             return Some(candidate.to_string());
         }
         return None;
     }
+    // Executables carry extensions on Windows (`gray` is `gray.exe`).
+    let names: Vec<String> = {
+        #[cfg(windows)]
+        {
+            [".exe", ".cmd", ".bat", ".com", ".ps1", ""]
+                .iter()
+                .map(|ext| format!("{candidate}{ext}"))
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            vec![candidate.to_string()]
+        }
+    };
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
-        let full = dir.join(candidate);
-        if full.is_file() && is_executable(&full) {
-            return Some(full.to_string_lossy().into_owned());
+        for name in &names {
+            let full = dir.join(name);
+            if full.is_file() && is_executable(&full) {
+                return Some(full.to_string_lossy().into_owned());
+            }
         }
     }
     None
@@ -129,12 +201,11 @@ fn absolutize(path: &Path) -> std::path::PathBuf {
 
 fn shellexpand_home(raw: &str) -> String {
     if raw == "~" || raw.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = Path::new(&home).to_string_lossy().into_owned();
+        if let Some(home) = crate::config::user_home() {
             return if raw == "~" {
-                home
+                home.to_string_lossy().into_owned()
             } else {
-                format!("{home}/{}", &raw[2..])
+                home.join(&raw[2..]).to_string_lossy().into_owned()
             };
         }
     }

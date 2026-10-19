@@ -37,17 +37,40 @@ pub fn now_secs() -> f64 {
         .unwrap_or_default()
 }
 
+/// Fill `bytes` with whatever entropy the platform offers: /dev/urandom on
+/// unix, elsewhere OS-seeded RandomState keys mixed with time and pid.
+/// These ids need uniqueness, not secrecy.
+pub fn random_bytes(bytes: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(bytes).is_ok() {
+                return;
+            }
+        }
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    let mut i = 0;
+    while i < bytes.len() {
+        h.write_usize(i);
+        let chunk = h.finish().to_le_bytes();
+        let n = chunk.len().min(bytes.len() - i);
+        bytes[i..i + n].copy_from_slice(&chunk[..n]);
+        i += n;
+    }
+}
+
 pub fn uuid_hex() -> String {
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        // Fallback: time + pid entropy — ids only need uniqueness.
-        let nanos = now_secs().to_bits();
-        bytes[..8].copy_from_slice(&nanos.to_le_bytes());
-        bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
-    }
+    random_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
