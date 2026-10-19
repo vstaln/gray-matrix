@@ -100,15 +100,106 @@ struct Consume {
 }
 
 /// Held while a turn runs on a conversation home.
-#[cfg(unix)]
-struct ProcessGroup(libc::pid_t);
+struct ProcessGroup {
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<JobGuard>,
+}
+
+impl ProcessGroup {
+    #[cfg(unix)]
+    fn new(pid: u32) -> Self {
+        Self { pid }
+    }
+
+    #[cfg(windows)]
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            job: assign_job(pid),
+        }
+    }
+
+    #[cfg(unix)]
+    fn disarm(&mut self) {
+        self.pid = 0;
+    }
+
+    #[cfg(windows)]
+    fn disarm(&mut self) {
+        self.pid = 0;
+        self.job = None;
+    }
+}
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if self.0 > 0 {
-            unsafe {
-                libc::kill(-self.0, libc::SIGKILL);
+        if self.pid > 0 {
+            kill_process_tree(self.pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", pid.to_string().as_str(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+
+#[cfg(windows)]
+struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobGuard {}
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            TerminateJobObject(self.0, 1);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+// taskkill /T needs the parent alive to walk the tree; a Job Object
+// terminates the tree even after the leader has exited.
+#[cfg(windows)]
+fn assign_job(pid: u32) -> Option<JobGuard> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+    unsafe {
+        let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+        if proc.is_null() {
+            return None;
+        }
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        let ok = !job.is_null() && AssignProcessToJobObject(job, proc) != 0;
+        CloseHandle(proc);
+        if ok {
+            Some(JobGuard(job))
+        } else {
+            if !job.is_null() {
+                CloseHandle(job);
             }
+            None
         }
     }
 }
@@ -292,6 +383,7 @@ pub async fn run_gray(
     // Dedicated workdir/profile: the matrix tools plus the minimal builtin
     // set — no lockfile plugins that might start another gateway.
     let work = home.join("work");
+    #[allow(unused_mut)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -433,15 +525,19 @@ exec {} sidecar --config {}
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
-    // Own process group so a timeout SIGKILL reaches grandchildren too.
-    // Windows has no process-group signal; the direct child still dies via
-    // kill_on_drop / kill() while grandchildren may linger briefly.
+    // Own process group so a timeout kill reaches grandchildren too:
+    // setpgid + SIGKILL on unix, a fresh process group + taskkill /T on Windows.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
@@ -476,8 +572,7 @@ exec {} sidecar --config {}
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
-    #[cfg(unix)]
-    let mut group = ProcessGroup(pid as libc::pid_t);
+    let mut group = ProcessGroup::new(pid);
     let live = Live::register(conversation, child.stdin.take());
 
     let stdout = child
@@ -489,29 +584,18 @@ exec {} sidecar --config {}
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await {
             Ok(r) => r,
             Err(_) => {
-                // Timeout: kill the whole process group where the platform
-                // gives us one, else the direct child.
-                #[cfg(unix)]
+                // Timeout: kill the whole process tree.
                 if pid != 0 {
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    }
+                    kill_process_tree(pid);
                 }
-                #[cfg(not(unix))]
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                #[cfg(unix)]
-                {
-                    group.0 = 0;
-                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                group.disarm();
                 return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child.wait().await;
-    #[cfg(unix)]
-    {
-        group.0 = 0;
-    }
+    group.disarm();
     let status = status.map_err(|_| RunError::Spawn("wait failed".to_string()))?;
     let consumed = outcome?;
 
