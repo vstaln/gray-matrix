@@ -55,20 +55,55 @@ pub fn svdir_from(svdir: Option<std::ffi::OsString>, home: Option<std::ffi::OsSt
     PathBuf::from("/var/service")
 }
 
+/// The comm name of a pid — /proc on Linux, `ps` on the other unixes.
+/// Windows detection never needs it (no runit/systemd to identify).
+#[cfg(target_os = "linux")]
 fn proc_comm(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|s| s.trim().to_string())
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn proc_comm(pid: u32) -> Option<String> {
+    std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("comm=")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+#[cfg(not(unix))]
+fn proc_comm(_pid: u32) -> Option<String> {
+    None
+}
+
 fn find_in_path(tool: &str) -> bool {
-    if tool.contains('/') {
+    if tool.contains('/') || tool.contains('\\') {
         return std::path::Path::new(tool).is_file();
     }
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file())
+    std::env::split_paths(&paths).any(|dir| {
+        if dir.join(tool).is_file() {
+            return true;
+        }
+        // Executables carry extensions on Windows.
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat", "com"] {
+                if dir.join(format!("{tool}.{ext}")).is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
 /// Which supervisor this box actually has. PID 1 decides first; the tools on
@@ -297,6 +332,14 @@ fn spawn_detached(argv: &[String], config_dir: &Path) -> Result<u32, String> {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: no console window, and the daemon keeps running
+        // after the spawning CLI exits (there is no session to leave).
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
     let child = command
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", argv[0]))?;
@@ -323,7 +366,27 @@ fn pid_alive(pid: u32) -> bool {
         // SAFETY: kill(pid, 0) only probes.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // No kill(0) on Windows; tasklist answers whether the pid lives.
+        std::process::Command::new("tasklist")
+            .arg("/NH")
+            .arg("/FO")
+            .arg("CSV")
+            .arg("/FI")
+            .arg(format!("PID eq {pid}"))
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().any(|line| {
+                    let mut f = line.split(',');
+                    let _image = f.next();
+                    f.next()
+                        .is_some_and(|p| p.trim_matches('"') == pid.to_string())
+                })
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -338,10 +401,26 @@ fn term_pid(pid: u32) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // No SIGTERM equivalent; /T takes the whole process tree so the
+        // daemon's children do not leak. The daemon never sees a graceful
+        // shutdown, so next boot reports the run as interrupted.
+        let out = std::process::Command::new("taskkill")
+            .arg("/F")
+            .arg("/T")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            _ => Err(format!("could not stop pid {pid}")),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
-        Err("stopping a gray-supervised daemon needs a unix host".to_string())
+        Err("stopping a gray-supervised daemon is not supported here".to_string())
     }
 }
 

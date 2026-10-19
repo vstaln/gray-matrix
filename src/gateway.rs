@@ -589,6 +589,24 @@ async fn apply_sync(daemon: &Daemon, sync: &Value) {
     }
 }
 
+/// SIGTERM or SIGINT on unix; the console control event on Windows.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = int.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// The daemon: lock + pidfile, workers, sync loop, graceful stop.
 pub async fn run(config_path: &Path) -> Result<(), String> {
     let dir = config_dir(config_path);
@@ -625,10 +643,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .append(true)
         .open(dir.join("gateway.lock"))
         .map_err(|_| "cannot open gateway lock".to_string())?;
-    use std::os::unix::io::AsRawFd;
-    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked {
-        return Err("Another gateway is running".to_string());
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err("Another gateway is running".to_string());
+        }
+        Err(_) => return Err("cannot lock gateway".to_string()),
     }
     let _lock = lock_file;
 
@@ -718,15 +738,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .expect("SIGINT handler");
-            tokio::select! {
-                _ = term.recv() => {},
-                _ = int.recv() => {},
-            }
+            shutdown_signal().await;
             shutdown.notify_waiters();
         });
     }

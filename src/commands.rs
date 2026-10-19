@@ -337,13 +337,21 @@ pub fn render_result(out: &Value) -> Outcome {
 /// the provider config snapshot a turn would have left there. Best-effort
 /// — `cmd run` reports its own failure when this cannot complete.
 fn prepare_home(config: &Value, home: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    #[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        builder.mode(0o700);
+    }
+    builder
         .create(home)
         .map_err(|_| "cannot create conversation home".to_string())?;
-    let _ = std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700));
+    }
     let gray_home = config
         .get("gray_home")
         .and_then(Value::as_str)
@@ -412,7 +420,7 @@ async fn cmd_json_t(
         "PATH",
         crate::runner::child_path(
             std::env::var_os("PATH"),
-            std::env::var_os("HOME").map(PathBuf::from),
+            crate::config::user_home(),
             Path::new(gray_bin),
         ),
     );

@@ -2,7 +2,6 @@
 //! One conversation home per sha256(conversation); explicit session pointers
 //! only — never guess a shared session id.
 use serde_json::Value;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Cap on one NDJSON stdout line (matches gray's own wire limit).
@@ -101,19 +100,7 @@ struct Consume {
 }
 
 /// Held while a turn runs on a conversation home.
-struct ConversationLock {
-    _file: std::fs::File,
-    fd: i32,
-}
-
-impl Drop for ConversationLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.fd, libc::LOCK_UN);
-        }
-    }
-}
-
+#[cfg(unix)]
 struct ProcessGroup(libc::pid_t);
 
 impl Drop for ProcessGroup {
@@ -194,6 +181,7 @@ pub async fn steer(conversation: &str, text: &str) -> bool {
 }
 
 /// Single-quote shell escaping for launcher argv words.
+#[cfg(unix)]
 fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -204,31 +192,31 @@ pub(crate) fn child_path(
     current: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
     gray_bin: &Path,
-) -> String {
+) -> std::ffi::OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = gray_bin.parent() {
         dirs.push(dir.to_path_buf());
     }
     if let Some(home) = home {
+        #[cfg(unix)]
         dirs.push(home.join(".local/bin"));
+        // %USERPROFILE%\.cargoin is where rustup puts cargo on Windows.
         dirs.push(home.join(".cargo/bin"));
     }
-    let mut out: Vec<String> = dirs
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
     if let Some(current) = current {
         for part in std::env::split_paths(&current) {
-            let s = part.to_string_lossy().into_owned();
-            if !out.contains(&s) {
-                out.push(s);
+            if !dirs.contains(&part) {
+                dirs.push(part);
             }
         }
     }
-    if out.is_empty() {
-        out.push("/usr/bin:/bin".to_string());
+    if dirs.is_empty() {
+        #[cfg(windows)]
+        return std::ffi::OsString::new();
+        #[cfg(not(windows))]
+        return std::ffi::OsString::from("/usr/bin:/bin");
     }
-    out.join(":")
+    std::env::join_paths(&dirs).unwrap_or_default()
 }
 
 /// Run one isolated text turn and return the agent's final answer.
@@ -254,35 +242,34 @@ pub async fn run_gray(
     }
 
     let home = crate::session::conversation_home(config_path, conversation);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&home)
         .map_err(|_| RunError::Io("cannot create conversation home".to_string()))?;
-    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
 
-    // Non-blocking per-conversation lock, held for the whole turn.
+    // Non-blocking per-conversation lock, held for the whole turn. The
+    // descriptor is close-on-exec (unix) / non-inheritable (Windows), so a
+    // concurrently spawned gray child can never keep the lock alive after
+    // this runner future has returned; dropping the file unlocks it.
     let lock_file = std::fs::File::create(home.join("run.lock"))
         .map_err(|_| RunError::Io("cannot lock conversation".to_string()))?;
-    use std::os::unix::io::AsRawFd;
-    let lock_fd = lock_file.as_raw_fd();
-    // Do not let another concurrently spawned gray child inherit this lock
-    // descriptor. Otherwise a child for conversation B can keep conversation
-    // A's flock alive after A's runner future has returned.
-    let fd_flags = unsafe { libc::fcntl(lock_fd, libc::F_GETFD) };
-    if fd_flags < 0
-        || unsafe { libc::fcntl(lock_fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
-    {
-        return Err(RunError::Io("cannot protect conversation lock".to_string()));
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(RunError::Busy),
+        Err(_) => return Err(RunError::Io("cannot lock conversation".to_string())),
     }
-    let locked = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked {
-        return Err(RunError::Busy);
-    }
-    let _lock = ConversationLock {
-        _file: lock_file,
-        fd: lock_fd,
-    };
+    let _lock = lock_file;
 
     // Snapshot the provider config into the isolated home.
     let gray_home = config
@@ -305,13 +292,21 @@ pub async fn run_gray(
     // Dedicated workdir/profile: the matrix tools plus the minimal builtin
     // set — no lockfile plugins that might start another gateway.
     let work = home.join("work");
-    std::fs::DirBuilder::new()
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&work)
         .or_else(|e| if work.is_dir() { Ok(()) } else { Err(e) })
         .map_err(|_| RunError::Io("cannot create work directory".to_string()))?;
-    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
-    let launcher = home.join("matrix-sidecar");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
+    }
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "gray-matrix".to_string());
@@ -319,18 +314,44 @@ pub async fn run_gray(
         .to_str()
         .map(str::to_string)
         .unwrap_or_else(|| config_path.to_string_lossy().into_owned());
-    let script = format!(
-        "#!/bin/sh\nexec {} sidecar --config {}\n",
-        shell_word(&exe),
-        shell_word(&abs_config)
+    // What gray's `sidecar:` spawner can exec here: an sh script on unix, a
+    // batch file on Windows (std routes .cmd through cmd.exe).
+    #[cfg(windows)]
+    let (launcher, script) = (
+        home.join("matrix-sidecar.cmd"),
+        format!("@echo off\r\n\"{exe}\" sidecar --config \"{abs_config}\"\r\n"),
     );
-    std::fs::write(&launcher, script)
+    #[cfg(not(windows))]
+    let (launcher, script) = (
+        home.join("matrix-sidecar"),
+        format!(
+            "#!/bin/sh
+exec {} sidecar --config {}
+",
+            shell_word(&exe),
+            shell_word(&abs_config)
+        ),
+    );
+    std::fs::write(&launcher, &script)
         .map_err(|_| RunError::Io("cannot write launcher".to_string()))?;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| RunError::Io("cannot protect launcher".to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| RunError::Io("cannot protect launcher".to_string()))?;
+    }
+    // The profile parser unquotes but does not unescape; forward slashes
+    // keep a Windows path legible to it (and CreateProcess accepts them).
+    #[cfg(windows)]
+    let launcher_wire = launcher.to_string_lossy().replace('\\', "/");
+    #[cfg(not(windows))]
+    let launcher_wire = launcher.to_string_lossy().into_owned();
     let profile = format!(
-        "plugins:\n  - builtin: tools-minimal\n  - sidecar: {}\n",
-        serde_json::to_string(&launcher.to_string_lossy()).unwrap_or_default()
+        "plugins:
+  - builtin: tools-minimal
+  - sidecar: {}
+",
+        serde_json::to_string(&launcher_wire).unwrap_or_default()
     );
     std::fs::write(work.join("gray.yml"), profile)
         .map_err(|_| RunError::Io("cannot write profile".to_string()))?;
@@ -413,6 +434,9 @@ pub async fn run_gray(
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
     // Own process group so a timeout SIGKILL reaches grandchildren too.
+    // Windows has no process-group signal; the direct child still dies via
+    // kill_on_drop / kill() while grandchildren may linger briefly.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -438,7 +462,7 @@ pub async fn run_gray(
         "PATH",
         child_path(
             std::env::var_os("PATH"),
-            std::env::var_os("HOME").map(PathBuf::from),
+            crate::config::user_home(),
             Path::new(gray_bin),
         ),
     );
@@ -452,6 +476,7 @@ pub async fn run_gray(
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
+    #[cfg(unix)]
     let mut group = ProcessGroup(pid as libc::pid_t);
     let live = Live::register(conversation, child.stdin.take());
 
@@ -464,19 +489,29 @@ pub async fn run_gray(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await {
             Ok(r) => r,
             Err(_) => {
-                // Timeout: kill the whole process group.
+                // Timeout: kill the whole process group where the platform
+                // gives us one, else the direct child.
+                #[cfg(unix)]
                 if pid != 0 {
                     unsafe {
                         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                     }
                 }
+                #[cfg(not(unix))]
+                let _ = child.kill().await;
                 let _ = child.wait().await;
-                group.0 = 0;
+                #[cfg(unix)]
+                {
+                    group.0 = 0;
+                }
                 return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child.wait().await;
-    group.0 = 0;
+    #[cfg(unix)]
+    {
+        group.0 = 0;
+    }
     let status = status.map_err(|_| RunError::Spawn("wait failed".to_string()))?;
     let consumed = outcome?;
 
