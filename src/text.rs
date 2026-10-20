@@ -143,10 +143,7 @@ mod tests {
 
     #[test]
     fn fallback_stripped() {
-        assert_eq!(
-            strip_reply_fallback("> <@a:b> quoted\n\nreal"),
-            "real"
-        );
+        assert_eq!(strip_reply_fallback("> <@a:b> quoted\n\nreal"), "real");
         assert_eq!(strip_reply_fallback("plain"), "plain");
         assert_eq!(strip_reply_fallback("> not a reply"), "> not a reply");
     }
