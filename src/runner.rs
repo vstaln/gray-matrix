@@ -399,8 +399,13 @@ pub async fn run_gray(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
     }
+    // A reinstall under the running service reads as "<path> (deleted)";
+    // the launcher must exec the replacement at <path>.
     let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            let p = p.to_string_lossy();
+            p.strip_suffix(" (deleted)").unwrap_or(&p).to_string()
+        })
         .unwrap_or_else(|_| "gray-matrix".to_string());
     let abs_config = config_path
         .to_str()
