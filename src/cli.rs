@@ -117,7 +117,9 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         Value::String("--config".to_string()),
         Value::String(resolved),
     ];
-    let prev_exe = data.pointer("/plugins/matrix/argv/0").and_then(Value::as_str);
+    let prev_exe = data
+        .pointer("/plugins/matrix/argv/0")
+        .and_then(Value::as_str);
     if prev_exe.is_some_and(|p| p != exe && Path::new(p).is_file()) {
         return Err("Another matrix plugin is registered; refusing to overwrite it".to_string());
     }
@@ -195,7 +197,10 @@ fn queue(action: &QueueAction, config_path: &Path) -> Result<(), String> {
             }
             for i in items {
                 let text: String = i.text.chars().take(24).collect();
-                println!("{} [{}] {} {} ({}…)", i.id, i.state, i.target, i.sender, text);
+                println!(
+                    "{} [{}] {} {} ({}…)",
+                    i.id, i.state, i.target, i.sender, text
+                );
             }
             Ok(())
         }

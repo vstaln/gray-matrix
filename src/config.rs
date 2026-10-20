@@ -177,10 +177,7 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
             return Err("free_response_rooms must be an array of room IDs or aliases".to_string());
         }
     }
-    if data
-        .get("require_mention")
-        .is_some_and(|v| !v.is_boolean())
-    {
+    if data.get("require_mention").is_some_and(|v| !v.is_boolean()) {
         return Err("require_mention must be true or false".to_string());
     }
     for key in ["gray_bin", "gray_home", "workdir"] {

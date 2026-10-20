@@ -32,10 +32,7 @@ pub async fn doctor(config: &Value) -> Result<(), String> {
         .whoami()
         .await
         .map_err(|e| format!("authentication failed: {e}"))?;
-    let configured = config
-        .get("user_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let configured = config.get("user_id").and_then(Value::as_str).unwrap_or("");
     if !configured.is_empty() && configured != mxid {
         return Err("access token belongs to a different account than user_id".to_string());
     }

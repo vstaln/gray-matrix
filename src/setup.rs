@@ -326,9 +326,8 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
     };
     io.print_line(&format!("Authenticated as {user_id}."));
 
-    let rooms_answer = io.prompt(
-        "Rooms the bot may answer in, comma-separated (!id:server or #alias:server): ",
-    )?;
+    let rooms_answer =
+        io.prompt("Rooms the bot may answer in, comma-separated (!id:server or #alias:server): ")?;
     let rooms = csv(&rooms_answer);
     if rooms.is_empty()
         || !rooms
@@ -371,9 +370,8 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
         "In shared rooms the bot answers only when mentioned; DMs and \
          free-response rooms always turn.",
     );
-    let free_answer = io.prompt(
-        "Free-response rooms (no mention needed), comma-separated [none]: ",
-    )?;
+    let free_answer =
+        io.prompt("Free-response rooms (no mention needed), comma-separated [none]: ")?;
     let free_rooms = csv(&free_answer);
     if !free_rooms
         .iter()
@@ -406,9 +404,8 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
         }
     });
     if !free_rooms.is_empty() {
-        saved["free_response_rooms"] = Value::Array(
-            free_rooms.into_iter().map(Value::String).collect(),
-        );
+        saved["free_response_rooms"] =
+            Value::Array(free_rooms.into_iter().map(Value::String).collect());
     }
     // A re-run replaces only what the wizard asked about: limits and other
     // hand-tuned keys survive (unless they no longer validate).

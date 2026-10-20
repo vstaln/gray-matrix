@@ -338,7 +338,7 @@ pub fn render_result(out: &Value) -> Outcome {
 /// — `cmd run` reports its own failure when this cannot complete.
 fn prepare_home(config: &Value, home: &Path) -> Result<(), String> {
     #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
