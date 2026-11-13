@@ -12,6 +12,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
         "commands": ["/matrix"],
+        "command_descriptions": {"/matrix": "set up and manage the Matrix gateway"},
         "hooks": ["prompt/context"],
         "tools": [{
             "name": "matrix_send",
